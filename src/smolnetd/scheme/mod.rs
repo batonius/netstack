@@ -46,13 +46,14 @@ pub struct Smolnetd {
 
     input_queue: Rc<RefCell<VecDeque<Buffer>>>,
     buffer_pool: Rc<RefCell<BufferPool>>,
+
+    poll_at_ms: Vec<i64>,
 }
 
 impl Smolnetd {
     const MAX_PACKET_SIZE: usize = 2048;
     const SOCKET_BUFFER_SIZE: usize = 128; //packets
     const MIN_CHECK_TIMEOUT_MS: i64 = 10;
-    const MAX_CHECK_TIMEOUT_MS: i64 = 500;
 
     pub fn new(
         network_file: File,
@@ -103,6 +104,7 @@ impl Smolnetd {
             input_queue,
             network_file,
             buffer_pool,
+            poll_at_ms: vec![],
         }
     }
 
@@ -121,52 +123,62 @@ impl Smolnetd {
 
     pub fn on_udp_scheme_event(&mut self) -> Result<Option<()>> {
         self.udp_scheme.on_scheme_event()?;
-        let _ = self.poll()?;
+        self.poll()?;
         Ok(None)
     }
 
     pub fn on_tcp_scheme_event(&mut self) -> Result<Option<()>> {
         self.tcp_scheme.on_scheme_event()?;
-        let _ = self.poll()?;
+        self.poll()?;
         Ok(None)
     }
 
     pub fn on_icmp_scheme_event(&mut self) -> Result<Option<()>> {
         self.icmp_scheme.on_scheme_event()?;
-        let _ = self.poll()?;
+        self.poll()?;
         Ok(None)
     }
 
     pub fn on_time_event(&mut self) -> Result<Option<()>> {
-        let timeout = self.poll()?;
-        self.schedule_time_event(timeout)?;
+        // Assuming time events are never early
+        let cur_time_ms = self.get_cur_time_ms()?;
+        // Assuming poll_at_ms elements are unique and reversely ordered
+        let truncate_to = match self.poll_at_ms.binary_search_by(|a| cur_time_ms.cmp(a)) {
+            Ok(t) | Err(t) => t,
+        };
+        self.poll_at_ms.truncate(truncate_to);
+        self.poll()?;
         Ok(None)
     }
 
     fn schedule_time_event(&mut self, timeout: i64) -> Result<()> {
-        let mut time = TimeSpec::default();
-        if self.time_file.read(&mut time)? < size_of::<TimeSpec>() {
-            return Err(Error::from_syscall_error(
-                syscall::Error::new(syscall::EBADF),
-                "Can't read current time",
-            ));
+        let poll_at = self.get_cur_time_ms()? + timeout;
+
+        let add_timeout = match self.poll_at_ms.last() {
+            None => true,
+            Some(last_poll_at) if *last_poll_at > poll_at => true,
+            _ => false,
+        };
+
+        if add_timeout {
+            let mut time = TimeSpec::default();
+            time.tv_sec = poll_at / 1000;
+            time.tv_nsec = ((poll_at % 1000) * 1_000_000) as i32;
+            self.time_file
+                .write_all(&time)
+                .map_err(|e| Error::from_io_error(e, "Failed to write to time file"))?;
+            self.poll_at_ms.push(poll_at);
         }
-        let mut time_ms = time.tv_sec * 1000i64 + i64::from(time.tv_nsec) / 1_000_000i64;
-        time_ms += timeout;
-        time.tv_sec = time_ms / 1000;
-        time.tv_nsec = ((time_ms % 1000) * 1_000_000) as i32;
-        self.time_file
-            .write_all(&time)
-            .map_err(|e| Error::from_io_error(e, "Failed to write to time file"))?;
+
         Ok(())
     }
 
-    fn poll(&mut self) -> Result<i64> {
+    fn poll(&mut self) -> Result<()> {
         let mut iter_limit = 10usize;
         let timeout = loop {
             iter_limit -= 1;
             if iter_limit == 0 {
-                break 0;
+                break Some(0);
             }
             let timestamp = self.get_timestamp();
             match self.iface
@@ -174,22 +186,27 @@ impl Smolnetd {
             {
                 Err(err) => {
                     error!("poll error: {}", err);
-                    break 0;
+                    break Some(0);
                 }
-                Ok(None) => {
-                    break ::std::i64::MAX;
-                }
-                Ok(Some(n)) if n != 0 => {
-                    break ::std::cmp::min(::std::i64::MAX as u64, n) as i64;
-                }
+                Ok(wait_till) if self.input_queue.borrow().is_empty() => match wait_till {
+                    None => break None,
+                    Some(n) if n > timestamp => {
+                        break Some(::std::cmp::min(::std::i64::MAX as u64, (n - timestamp))
+                            as i64);
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         };
         self.notify_sockets()?;
-        Ok(::std::cmp::min(
-            ::std::cmp::max(Smolnetd::MIN_CHECK_TIMEOUT_MS, timeout),
-            Smolnetd::MAX_CHECK_TIMEOUT_MS,
-        ))
+
+        if let Some(timeout) = timeout {
+            let timeout = ::std::cmp::max(Smolnetd::MIN_CHECK_TIMEOUT_MS, timeout);
+            self.schedule_time_event(timeout)?;
+        }
+
+        Ok(())
     }
 
     fn read_frames(&mut self) -> Result<usize> {
@@ -210,6 +227,17 @@ impl Smolnetd {
             total_frames += 1;
         }
         Ok(total_frames)
+    }
+
+    fn get_cur_time_ms(&mut self) -> Result<i64> {
+        let mut time = TimeSpec::default();
+        if self.time_file.read(&mut time)? < size_of::<TimeSpec>() {
+            return Err(Error::from_syscall_error(
+                syscall::Error::new(syscall::EBADF),
+                "Can't read current time",
+            ));
+        }
+        Ok(time.tv_sec * 1000i64 + i64::from(time.tv_nsec) / 1_000_000i64)
     }
 
     fn get_timestamp(&self) -> u64 {
