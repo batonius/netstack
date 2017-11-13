@@ -177,17 +177,17 @@ impl Smolnetd {
                     break 0;
                 }
                 Ok(None) => {
-                    break ::std::u64::MAX;
+                    break ::std::i64::MAX;
                 }
-                Ok(Some(n)) if n > 0 => {
-                    break n;
+                Ok(Some(n)) if n != 0 => {
+                    break ::std::cmp::min(::std::i64::MAX as u64, n) as i64;
                 }
                 _ => {}
             }
         };
         self.notify_sockets()?;
         Ok(::std::cmp::min(
-            ::std::cmp::max(Smolnetd::MIN_CHECK_TIMEOUT_MS, timeout as i64),
+            ::std::cmp::max(Smolnetd::MIN_CHECK_TIMEOUT_MS, timeout),
             Smolnetd::MAX_CHECK_TIMEOUT_MS,
         ))
     }
